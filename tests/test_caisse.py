@@ -103,14 +103,12 @@ def test_espece_same_day_sales_can_pay_the_expense():
     assert not cash_is_covered(days, [99, 1000], entries)
 
 
-def test_espece_impossible_expense_does_not_crash(caplog):
+def test_espece_impossible_expense_raises():
     days = [date(2026, 1, d) for d in range(1, 4)]
     groups = [group(10), group(10), group(10)]
     entries = parse_entries([row(mode="espece", d="2026-01-02", montant="5000")])
-    ordered = order_days_for_cash(days, groups, entries)
-    assert len(ordered) == 3
-    assert "cannot be covered" in caplog.text
-
+    with pytest.raises(CaisseError, match="cannot be covered"):
+        order_days_for_cash(days, groups, entries)
 
 def test_split_daily_sales_by_mode(tmp_path):
     source = tmp_path / "daily_sales.csv"
