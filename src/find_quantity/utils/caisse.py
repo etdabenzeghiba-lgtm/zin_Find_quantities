@@ -215,16 +215,17 @@ def order_days_for_cash(
         if cash_is_covered(days, totals(candidate), movements):
             return candidate
 
-    best = sorted(groups, key=_day_total, reverse=True)
+        best = sorted(groups, key=_day_total, reverse=True)
     if not cash_is_covered(days, totals(best), movements):
         total_sales = sum(totals(best))
         total_spent = sum(m.amount for m in movements)
-        logger.warning(
+        raise CaisseError(
             f"Cash expenses ({total_spent:,.2f}) cannot be covered by the sales "
-            f"({total_sales:,.2f}) at the requested dates. Best order used."
+            f"({total_sales:,.2f}) at the requested dates in caisse.csv. "
+            "Increase the showroom sales, move the expense dates later, "
+            "or reduce the expense amounts."
         )
     return best
-
 
 def split_daily_sales_by_mode(
     source: Path,
