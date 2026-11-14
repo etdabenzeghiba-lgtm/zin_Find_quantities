@@ -1,0 +1,39 @@
+# Days with NO sales, in addition to Fridays (Fridays are always skipped).
+# Write one date per line, in the format:   - YYYY-MM-DD
+# Keep the two spaces at the start and the dash. Everything after # is a comment.
+#
+# Religious dates (Aid, Mouharram, Achoura, Mouloud) depend on the moon sighting.
+# The 2026 dates follow the published calendar; the 2027 dates are ESTIMATES.
+# Edit them when the official announcement is made, and add new years below.
+holidays:
+  # ---- 2026 ----
+  - 2026-01-01  # Nouvel An
+  - 2026-01-12  # Yennayer
+  - 2026-03-20  # Aid el-Fitr (day 1)
+  - 2026-03-21  # Aid el-Fitr (day 2)
+  - 2026-03-22  # Aid el-Fitr (day 3)
+  - 2026-05-01  # Fete du Travail
+  - 2026-05-27  # Aid el-Adha (day 1)
+  - 2026-05-28  # Aid el-Adha (day 2)
+  - 2026-05-29  # Aid el-Adha (day 3)
+  - 2026-06-17  # Awal Mouharram (Nouvel An hegirien)
+  - 2026-06-26  # Achoura
+  - 2026-07-05  # Fete de l'Independance
+  - 2026-08-26  # Mouloud (Mawlid Ennabaoui)
+  - 2026-11-01  # Fete de la Revolution
+
+  # ---- 2027 (estimates for the religious dates) ----
+  - 2027-01-01  # Nouvel An
+  - 2027-01-12  # Yennayer
+  - 2027-03-10  # Aid el-Fitr (day 1) - estimate
+  - 2027-03-11  # Aid el-Fitr (day 2) - estimate
+  - 2027-03-12  # Aid el-Fitr (day 3) - estimate
+  - 2027-05-01  # Fete du Travail
+  - 2027-05-17  # Aid el-Adha (day 1) - estimate
+  - 2027-05-18  # Aid el-Adha (day 2) - estimate
+  - 2027-05-19  # Aid el-Adha (day 3) - estimate
+  - 2027-06-06  # Awal Mouharram - estimate
+  - 2027-06-15  # Achoura - estimate
+  - 2027-07-05  # Fete de l'Independance
+  - 2027-08-15  # Mouloud - estimate
+  - 2027-11-01  # Fete de la Revolution

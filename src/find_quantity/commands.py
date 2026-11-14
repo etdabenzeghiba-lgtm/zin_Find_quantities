@@ -1,0 +1,412 @@
+import logging
+import random
+
+import duckdb
+
+from find_quantity.configs import config
+from find_quantity.acquire_data.extract_csv import (
+    extract_calculation_report,
+    extract_products,
+    extract_showrooms,
+)
+from find_quantity.models import Inventory, ShowRoom
+from find_quantity.acquire_data.read_merge_configs import parse_merge_configs
+from find_quantity.report import Report
+from find_quantity.utils.workdays import load_holidays, selling_days
+from find_quantity.utils.caisse import (
+    CCP,
+    ESPECE,
+    CaisseRules,
+    days_before_encaissement,
+    order_days_for_cash,
+    read_caisse,
+    split_daily_sales_by_mode,
+)
+from find_quantity.solver import Metrics, Solver
+from find_quantity.acquire_data.transformer_csv import (
+    ProductTransformer,
+    ShowroomTransformer,
+)
+
+logger = logging.getLogger("find_quantity.cli")
+
+
+def warn_if_no_holidays_for_year(holidays) -> None:
+    if not any(h.year == config.YEAR for h in holidays):
+        logger.warning(
+            f"No holidays found for {config.YEAR} in {config.HOLIDAYS_PATH.name}. "
+            "Only Fridays will be skipped."
+        )
+
+
+class SetupFolderStructure:
+    def execute(self) -> None:
+        if config.CLEAN_BEFORE_EACH_RUN:
+            config.clean_up()
+
+        config.create_folders()
+        report = Report(output_folder=config.PROJECT_FOLDER)
+        message = (
+            "\nThe {} doesn't exists.\nPlease Replace the template in the folder {}."
+        )
+
+        quit_ = False
+        if not config.RAW_PRODUCTS_DATA.exists():
+            logger.info(message.format(config.RAW_PRODUCTS_DATA, config.PROJECT_FOLDER))
+            report.write_product_input_template_file(path=config.RAW_PRODUCTS_DATA)
+            quit_ = True
+
+        if not config.RAW_SHOWROOMS_DATA.exists():
+            logger.info(
+                message.format(config.RAW_SHOWROOMS_DATA, config.PROJECT_FOLDER)
+            )
+            report.write_showroom_input_template_file(path=config.RAW_SHOWROOMS_DATA)
+            quit_ = True
+
+        if not config.MERGE_CONFIG_PATH.exists():
+            config.copy_merge_configs()
+            logger.info(f"\nThe {config.MERGE_CONFIG_PATH.name} has been created.")
+
+        if not config.CAISSE_PATH.exists():
+            report.write_caisse_input_template_file(path=config.CAISSE_PATH)
+            logger.info(
+                f"\nThe {config.CAISSE_PATH.name} has been created (empty). "
+                "Fill it to apply the CCP / espece rules."
+            )
+
+        if not config.HOLIDAYS_PATH.exists():
+            config.copy_holidays_config()
+            logger.info(f"\nThe {config.HOLIDAYS_PATH.name} has been created.")
+
+        if quit_:
+            exit(0)
+
+
+class ProcessFilesCommand:
+    def execute(self) -> None:
+        report = Report(output_folder=config.STEP_ONE_TRANSFORM_PATH)
+        products = extract_products(path=config.RAW_PRODUCTS_DATA)
+        showrooms = extract_showrooms(path=config.RAW_SHOWROOMS_DATA)
+        if len(showrooms) != len(products):
+            message = "Number of months mismatch in showroom.csv and produits.csv"
+            logger.exception(message)
+            raise ValueError(message)
+        for month, s_list, p_list in zip(
+            showrooms.keys(), showrooms.values(), products.values()
+        ):
+            p_transfomer = ProductTransformer(products=p_list)
+            p_list = p_transfomer.load()
+            s_list = ShowroomTransformer(showrooms=s_list).transform()
+            report.write_product_transformed(month=month, products=p_list)
+            report.write_showroom_transformed(month=month, showrooms=s_list)
+
+
+class CalculateQuantitiesCommand:
+    def execute(self):
+        report = Report(output_folder=config.STEP_TWO_CALCULATE_PATH)
+        merge_rules = parse_merge_configs(path=config.MERGE_CONFIG_PATH)
+        p_list_all = extract_products(
+            path=config.STEP_ONE_TRANSFORM_PATH / "products_transformed.csv"
+        )
+        s_list_all = extract_showrooms(
+            path=config.STEP_ONE_TRANSFORM_PATH / "showrooms_transformed.csv"
+        )
+        for month, p_list, s_list in zip(
+            p_list_all.keys(), p_list_all.values(), s_list_all.values()
+        ):
+            # TODO: Remove this later
+            # if int(month) >= 2:
+            #     break
+
+            products = ProductTransformer(products=p_list).load()
+            showrooms = ShowroomTransformer(showrooms=s_list).load()
+            inv = Inventory(merge_rules=merge_rules)
+            inv.add_products(products=products)
+            solver = Solver()
+
+            # Filter showrooms with zero sales
+            showrooms = [sh for sh in showrooms if sh.assigned_total_sales]
+
+            # Global showroom
+            monthly_showroom = ShowRoom(
+                refrence=f"All_Month_{month}",
+                assigned_total_sales=sum([sh.assigned_total_sales for sh in showrooms]),
+                droit_timbre=showrooms[0].droit_timbre,
+                code_showroom=showrooms[0].code_showroom,
+                rc=showrooms[0].rc,
+                ai=showrooms[0].ai,
+                address=showrooms[0].address,
+            )
+            logger.info(f"Working on {monthly_showroom}")
+            sales = solver.distribute_products_monthly(
+                inventory=inv, target_amount=monthly_showroom.assigned_total_sales
+            )
+            monthly_showroom.add_sales(sales)
+            report.write_product_transformed(
+                products=inv.get_products(), month=month, filename_prefix="_remaining"
+            )
+
+            # # Single Showrooms - Recreate new products list
+            inv = Inventory(merge_rules=merge_rules)
+            inv.add_products_from_sales(monthly_showroom.sales)
+            last_showroom = showrooms[-1]
+            for sh in showrooms:
+                sales = solver.distribute_products_by_showroom(
+                    inventory=inv, target_amount=sh.assigned_total_sales
+                )
+                sh.add_sales(sales)
+                if sh is last_showroom:
+                    sh.add_sales(solver.allocate_remaining_products(inventory=inv))
+                report.write_showrooms_report(month=month, showroom=sh)
+                report.write_metrics(metrics=Metrics(showroom=sh), month=month)
+
+
+class DevideProductToSellingDays:
+    def execute(self):
+        solver = Solver()
+        report = Report(output_folder=config.STEP_THREE_VALIDATE_PATH)
+        merge_rules = parse_merge_configs(path=config.MERGE_CONFIG_PATH)
+        calculation_report: dict[int, dict[str, ShowRoom]] = extract_calculation_report(
+            path=config.STEP_TWO_CALCULATE_PATH / "showrooms_calculation_report.csv"
+        )
+        holidays = load_holidays(config.HOLIDAYS_PATH)
+        warn_if_no_holidays_for_year(holidays)
+        caisse_entries = read_caisse(
+            config.CAISSE_PATH, config.IN_ENCODING, config.CSV_SEPERATOR
+        )
+        caisse = CaisseRules(caisse_entries)
+        for month, showrooms in calculation_report.items():
+            logger.info(f"Daily Product Distribution {month}")
+            # Every day of the month except Fridays and holidays
+            days = selling_days(config.YEAR, month, holidays)
+            for i, sh in enumerate(showrooms.values()):
+                mode = caisse.mode_of(month, sh.code_showroom)
+                movements = caisse.movements(month, sh.code_showroom)
+                if caisse_entries and mode is None:
+                    logger.warning(
+                        f"{sh.refrence} ({sh.code_showroom}) is not in {config.CAISSE_PATH.name} "
+                        f"for month {month}: no CCP / espece rule applied."
+                    )
+                sh_days = days
+                if mode == CCP:
+                    sh_days = days_before_encaissement(days, movements)
+                logger.info(
+                    f"\t {month}-{i + 1:2}: Processing {sh} - {len(sh_days)} selling days"
+                    f" - mode {mode or 'none'}"
+                )
+                inv = Inventory(merge_rules=merge_rules)
+                inv.add_products_from_sales(sh.sales)
+                daily_sales = list(
+                    solver.distrubute_products_equally(inv, len(sh_days))
+                )
+                if mode == ESPECE:
+                    daily_sales = order_days_for_cash(sh_days, daily_sales, movements)
+                for day, sales in zip(sh_days, daily_sales):
+                    sh.add_daily_sales(
+                        day=day.day, month=month, year=config.YEAR, sales=sales
+                    )
+
+                # Split by client
+                for day in sh.daily_sales:
+                    nb_customers = day.total_units_sold
+                    inv = Inventory(merge_rules=merge_rules)
+                    inv.add_products_from_sales(day.sales)
+                    sales_per_customer = solver.distrubute_products_equally(
+                        inv, nb_customers
+                    )
+                    day.add_customer_sales(sales_per_customer)
+                report.write_daily_sales(month=month, showroom=sh)
+
+
+class DevideProductBonDeMoument:
+    # Same function as the DevideProductToSellingDays but with less days.
+    MAX_MONTHLY_SHIPPMENTS = 4
+    MIN_MONTHLY_SHIPPMENTS = 2
+    MIN_RANDOM_DAYS_DIFFERENCE = 3
+
+    def execute(self):
+        solver = Solver()
+        report = Report(output_folder=config.STEP_THREE_VALIDATE_PATH)
+        merge_rules = parse_merge_configs(path=config.MERGE_CONFIG_PATH)
+        calculation_report: dict[int, dict[str, ShowRoom]] = extract_calculation_report(
+            path=config.STEP_TWO_CALCULATE_PATH / "showrooms_calculation_report.csv"
+        )
+        holidays = load_holidays(config.HOLIDAYS_PATH)
+        for month, showrooms in calculation_report.items():
+            logger.info(f"Bon De Mouvement Generation {month}")
+            available_days = [d.day for d in selling_days(config.YEAR, month, holidays)]
+            for i, sh in enumerate(showrooms.values()):
+                # Devide to random days (never a Friday or a holiday)
+                DAYS_COUNT = random.randint(
+                    self.MIN_MONTHLY_SHIPPMENTS, self.MAX_MONTHLY_SHIPPMENTS
+                )
+                random_days = self.gen_random_days(DAYS_COUNT, available_days)
+
+                logger.info(
+                    f"\t {month}-{i + 1:2}: Processing {sh} - Random Days Count {DAYS_COUNT}:  [{random_days}]"
+                )
+                inv = Inventory(merge_rules=merge_rules)
+                inv.add_products_from_sales(sh.sales)
+                daily_sales = solver.distrubute_products_randomly(inv, DAYS_COUNT)
+                for day, sales in zip(random_days, daily_sales):
+                    sh.add_daily_sales(
+                        day=day,
+                        month=month,
+                        year=config.YEAR,
+                        sales=sales,
+                    )
+
+                report.write_bon_de_mouvement(
+                    month=month,
+                    showroom=sh,
+                )
+
+    def gen_random_days(
+        self, days_count: int, available_days: list[int]
+    ) -> list[int]:
+        """Pick days_count days among the selling days, spaced apart when possible."""
+        days: list[int] = []
+        for candidate in random.sample(available_days, k=len(available_days)):
+            if len(days) == days_count:
+                break
+            if all(
+                abs(candidate - day) >= self.MIN_RANDOM_DAYS_DIFFERENCE for day in days
+            ):
+                days.append(candidate)
+        # If spacing was not possible, complete with any remaining selling days
+        for candidate in available_days:
+            if len(days) == days_count:
+                break
+            if candidate not in days:
+                days.append(candidate)
+        return days
+
+
+class CalculateDroitDeTimbre:
+    def execute(self):
+        logger.info("Droit de Timbre Calculation")
+        input_file = config.STEP_THREE_VALIDATE_PATH / "daily_sales.csv"
+        output_file = input_file
+
+        conn = duckdb.connect(input_file)
+        conn.sql("""
+        CREATE OR REPLACE TEMP TABLE daily_sales_dt AS (
+            WITH agg AS (
+                -- Select columns
+                SELECT
+                    showroom
+                    , "Droit-Timbre" AS Showroom_MAX_DT
+                    , customer_id
+                    , sum("Total TTC") AS customer_total_ttc
+                    ,
+                FROM
+                    daily_sales
+                GROUP BY
+                    showroom
+                    , Showroom_MAX_DT
+                    , customer_id
+            )
+            , calculate_dt AS (
+                -- Calculate DT per customer
+                SELECT
+                    *
+                    , CASE WHEN (customer_total_ttc > 100_000) THEN .02 * customer_total_ttc
+                           WHEN (customer_total_ttc > 30_000) THEN .015 * customer_total_ttc
+                           WHEN (customer_total_ttc > 300) THEN .01 * customer_total_ttc
+                           ELSE 0
+                      END AS dt_calculated_per_c
+                FROM
+                    agg
+            )
+            , dt_added AS (
+                SELECT
+                    -- Add dt_cummulative_sh (per showroom), and dt_declarer_c (per customer)
+                    *
+                    , sum(dt_calculated_per_c) OVER (PARTITION BY showroom ORDER BY customer_id) AS DT_calculated_cumulative_sh
+                    , CASE WHEN DT_calculated_cumulative_sh > Showroom_MAX_DT THEN 0
+                           ELSE dt_calculated_per_c
+                      END dt_declarer_c
+                FROM
+                    calculate_dt
+            )
+            , joined AS (
+                -- distribute values based on percentage
+                SELECT
+                    o.*
+                    , "Total TTC" / n.customer_total_ttc AS total_ttc_percentage
+                    , n.dt_calculated_per_c * total_ttc_percentage AS dt_calculated
+                    , n.dt_declarer_c * total_ttc_percentage AS dt_declarer
+                    , n.DT_calculated_cumulative_sh
+                FROM
+                    daily_sales AS o
+                    LEFT JOIN dt_added n ON n.customer_id = o.customer_id
+            )
+            -- Order and return final columns
+            SELECT
+                mois
+                , showroom
+                , "Code-Showroom"
+                , Address
+                , "Droit-Timbre"
+                , AI
+                , RC
+                , date
+                , day
+                , c_id
+                , upper(md5(customer_id)) AS customer_id
+                , n_article
+                , designation
+                , groupe_code
+                , prix
+                , RTA
+                , TEE
+                , TVA
+                , Units_sold
+                , Total
+                , "Total TTC"
+                , dt_calculated
+                , dt_declarer
+                , "Ticket-Number"
+                , "Etat-De-Vente"
+            FROM
+                JOINED
+            ORDER BY
+                showroom
+                , date
+                , c_id
+            );
+             """)
+
+        conn.sql(f"""
+            COPY (
+                SELECT
+                    *
+                FROM
+                    daily_sales_dt)
+                TO '{output_file}' (HEADER , DELIMITER ';');
+              """)
+
+
+class SplitDailySalesByMode:
+    """Separate "etat des tickets de caisse" for CCP and for espece."""
+
+    def execute(self):
+        caisse = CaisseRules(
+            read_caisse(config.CAISSE_PATH, config.IN_ENCODING, config.CSV_SEPERATOR)
+        )
+        written = split_daily_sales_by_mode(
+            source=config.STEP_THREE_VALIDATE_PATH / "daily_sales.csv",
+            rules=caisse,
+            output_folder=config.STEP_THREE_VALIDATE_PATH,
+        )
+        for path in written:
+            logger.info(f"Created {path.name}")
+
+
+if __name__ == "__main__":
+    from find_quantity.utils.logs import logger
+
+    # config.clean_up()
+    # c = ProcessFilesCommand().execute()
+    # c = CalculateQuantitiesCommand().execute()
+    c = DevideProductToSellingDays().execute()
