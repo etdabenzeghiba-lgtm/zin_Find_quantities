@@ -60,11 +60,14 @@ mois;showroom;Code-Showroom;mode;date;montant
 * `mode` is `CCP` or `espece`. A showroom has ONE mode per month (mixing them is refused).
 * **CCP**: all the tickets de caisse are dated strictly BEFORE the date of the encaissement.
 * **espece**: each row is a daily cash expense. On its date, the sales so far (that day included)
-  must cover all the expenses so far. The amounts are compared with the sales total without taxes (`Total`).
+  must cover all the expenses so far. If the equal split over the days can't do it, the program puts
+  more sales in the first days, just enough to pay the expenses on their dates. If the expenses are
+  higher than all the sales, a warning names the date that fails. The amounts are compared with the sales total without taxes (`Total`).
 * Dates: `YYYY-MM-DD` (or `DD/MM/YYYY`). Amounts: `1234.50` or `1234,50`.
 * A showroom missing from the file gets no rule (a warning is shown).
-* Results: `daily_sales.csv` (all) plus `daily_sales_CCP.csv` and `daily_sales_ESPECE.csv`
-  (separate etats), in `output/3-Validate`.
+* Results, in `output/3-Validate`: `daily_sales_CCP.csv` and `daily_sales_ESPECE.csv` (separate etats,
+  never mixed). Showrooms missing from `caisse.csv` go to `daily_sales_sans_mode.csv`.
+  If `caisse.csv` is empty, the usual single `daily_sales.csv` is kept.
 
 
 ## Selling days and holidays

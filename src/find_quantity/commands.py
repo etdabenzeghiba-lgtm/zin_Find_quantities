@@ -18,7 +18,7 @@ from find_quantity.utils.caisse import (
     ESPECE,
     CaisseRules,
     days_before_encaissement,
-    order_days_for_cash,
+    distribute_for_cash,
     read_caisse,
     split_daily_sales_by_mode,
 )
@@ -194,13 +194,21 @@ class DevideProductToSellingDays:
                     f"\t {month}-{i + 1:2}: Processing {sh} - {len(sh_days)} selling days"
                     f" - mode {mode or 'none'}"
                 )
-                inv = Inventory(merge_rules=merge_rules)
-                inv.add_products_from_sales(sh.sales)
-                daily_sales = list(
-                    solver.distrubute_products_equally(inv, len(sh_days))
-                )
+                def make_inventory(sales_=sh.sales):
+                    inv_ = Inventory(merge_rules=merge_rules)
+                    inv_.add_products_from_sales(sales_)
+                    return inv_
+
                 if mode == ESPECE:
-                    daily_sales = order_days_for_cash(sh_days, daily_sales, movements)
+                    daily_sales = distribute_for_cash(
+                        solver, make_inventory, sh_days, movements
+                    )
+                else:
+                    daily_sales = list(
+                        solver.distrubute_products_equally(
+                            make_inventory(), len(sh_days)
+                        )
+                    )
                 for day, sales in zip(sh_days, daily_sales):
                     sh.add_daily_sales(
                         day=day.day, month=month, year=config.YEAR, sales=sales
@@ -401,6 +409,10 @@ class SplitDailySalesByMode:
         )
         for path in written:
             logger.info(f"Created {path.name}")
+        if written:
+            # The separate files hold every row: keep only them, so that CCP and
+            # espece are never mixed in one daily sales file.
+            (config.STEP_THREE_VALIDATE_PATH / "daily_sales.csv").unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

@@ -103,12 +103,14 @@ def test_espece_same_day_sales_can_pay_the_expense():
     assert not cash_is_covered(days, [99, 1000], entries)
 
 
-def test_espece_impossible_expense_raises():
+def test_espece_impossible_expense_does_not_crash(caplog):
     days = [date(2026, 1, d) for d in range(1, 4)]
     groups = [group(10), group(10), group(10)]
     entries = parse_entries([row(mode="espece", d="2026-01-02", montant="5000")])
-    with pytest.raises(CaisseError, match="cannot be covered"):
-        order_days_for_cash(days, groups, entries)
+    ordered = order_days_for_cash(days, groups, entries)
+    assert len(ordered) == 3
+    assert "cannot be covered" in caplog.text
+
 
 def test_split_daily_sales_by_mode(tmp_path):
     source = tmp_path / "daily_sales.csv"
@@ -133,3 +135,116 @@ def test_split_daily_sales_by_mode(tmp_path):
     assert "Alger" in (tmp_path / "daily_sales_CCP.csv").read_text()
     assert "Alger" not in (tmp_path / "daily_sales_ESPECE.csv").read_text()
     assert source.exists()
+
+
+def test_espece_warning_names_the_date_and_totals(caplog):
+    days = [date(2026, 1, d) for d in range(1, 4)]
+    groups = [group(100), group(100), group(100)]
+    # Total sales 300 > expense 250, but on January 1st only 100 can be sold
+    entries = parse_entries([row(mode="espece", d="2026-01-01", montant="250")])
+    order_days_for_cash(days, groups, entries)
+    assert "2026-01-01" in caplog.text
+    assert "100.00" in caplog.text and "250.00" in caplog.text
+
+
+def test_espece_rounding_error_is_not_a_problem():
+    days = [date(2026, 1, 1), date(2026, 1, 2)]
+    entries = parse_entries([row(mode="espece", d="2026-01-02", montant="123949500")])
+    # sum of the days is a hair under the expense because of float rounding
+    assert cash_is_covered(days, [123949499.999999, 0.0], entries)
+
+
+# ---- real distribution with the cash rule ----
+from find_quantity.models import Inventory
+from find_quantity.solver import Solver
+from find_quantity.utils.caisse import (
+    cash_weights,
+    distribute_for_cash,
+    weighted_quantities,
+)
+
+
+def month_days(n=25):
+    return [date(2026, 6, d) for d in range(1, n + 1)]
+
+
+def showroom_sales():
+    return [
+        Sale(
+            product=gen_test_product(n_article=f"A{i}", stock_qt=200 + i, prix=100 + i * 7),
+            units_sold=200 + i,
+        )
+        for i in range(8)
+    ]
+
+
+def make_inventory():
+    inv = Inventory(merge_rules=[])
+    inv.add_products_from_sales(showroom_sales())
+    return inv
+
+
+def totals_of(groups):
+    return [sum(s.sale_total_amount for s in g) for g in groups]
+
+
+def test_weighted_quantities_keep_the_total():
+    for qty in (0, 1, 7, 200, 1001):
+        parts = weighted_quantities([5.0, 1.0, 1.0, 0.0, 3.0], qty)
+        assert sum(parts) == qty
+        assert parts[3] == 0
+
+
+def test_cash_weights_impossible_cases():
+    days = month_days()
+    too_early = parse_entries([row(mode="espece", d="2026-05-01", montant="10")])
+    assert cash_weights(days, too_early, 1000, 0.02) is None
+    too_big = parse_entries([row(mode="espece", d="2026-06-30", montant="5000")])
+    assert cash_weights(days, too_big, 1000, 0.02) is None
+
+
+def test_big_early_expense_is_really_covered():
+    """The bug seen in real use: total sales > expenses, but the expense is early."""
+    days = month_days()
+    solver = Solver()
+    total = sum(totals_of(solver.distrubute_products_equally(make_inventory(), len(days))))
+    amount = round(total * 0.42)  # 42% of the month's sales needed by June 3rd
+    entries = parse_entries([row(mode="espece", d="2026-06-03", montant=str(amount))])
+    for _ in range(10):  # random: try several times
+        groups = distribute_for_cash(solver, make_inventory, days, entries)
+        assert len(groups) == len(days)
+        day_totals = totals_of(groups)
+        assert cash_is_covered(days, day_totals, entries)
+        assert abs(sum(day_totals) - total) < 1e-6  # all the sales are still used
+
+
+def test_two_expenses_are_both_covered():
+    days = month_days()
+    solver = Solver()
+    total = sum(totals_of(solver.distrubute_products_equally(make_inventory(), len(days))))
+    entries = parse_entries(
+        [
+            row(mode="espece", d="2026-06-02", montant=str(round(total * 0.2))),
+            row(mode="espece", d="2026-06-08", montant=str(round(total * 0.3))),
+        ]
+    )
+    groups = distribute_for_cash(solver, make_inventory, days, entries)
+    assert cash_is_covered(days, totals_of(groups), entries)
+
+
+def test_easy_expense_keeps_an_equal_looking_split():
+    days = month_days()
+    solver = Solver()
+    entries = parse_entries([row(mode="espece", d="2026-06-25", montant="100")])
+    groups = distribute_for_cash(solver, make_inventory, days, entries)
+    day_totals = totals_of(groups)
+    assert max(day_totals) < 2 * (sum(day_totals) / len(days))  # no concentration
+
+
+def test_expense_bigger_than_all_sales_warns_but_works(caplog):
+    days = month_days()
+    solver = Solver()
+    entries = parse_entries([row(mode="espece", d="2026-06-10", montant="999999999")])
+    groups = distribute_for_cash(solver, make_inventory, days, entries)
+    assert len(groups) == len(days)
+    assert "cannot be covered" in caplog.text

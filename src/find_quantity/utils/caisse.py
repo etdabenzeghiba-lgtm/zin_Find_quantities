@@ -15,6 +15,7 @@ same showroom in the same month is refused.
 
 import csv
 import logging
+import math
 import random
 import unicodedata
 from dataclasses import dataclass
@@ -174,17 +175,55 @@ def _day_total(sales: list[Sale]) -> float:
     return sum(s.sale_total_amount for s in sales)
 
 
+# One centime of tolerance: avoids false alarms from float rounding on big amounts
+CASH_TOLERANCE = 0.01
+
+
+def first_cash_problem(
+    days: list[date], day_totals: list[float], movements: list[CaisseEntry]
+) -> tuple[CaisseEntry, float, float] | None:
+    """First expense that is not covered: (expense, sales until its date,
+    expenses until its date). None if every expense is covered."""
+    for m in movements:
+        sold = sum(t for d, t in zip(days, day_totals) if d <= m.date)
+        spent = sum(x.amount for x in movements if x.date <= m.date)
+        if sold + CASH_TOLERANCE < spent:
+            return m, sold, spent
+    return None
+
+
 def cash_is_covered(
     days: list[date], day_totals: list[float], movements: list[CaisseEntry]
 ) -> bool:
     """True if on every expense date, the cumulative sales (that day included)
     cover the cumulative expenses (that day included)."""
-    for m in movements:
-        sold = sum(t for d, t in zip(days, day_totals) if d <= m.date)
-        spent = sum(x.amount for x in movements if x.date <= m.date)
-        if sold + 1e-9 < spent:
-            return False
-    return True
+    return first_cash_problem(days, day_totals, movements) is None
+
+
+def _random_order_that_works(
+    days: list[date], groups: list[list[Sale]], movements: list[CaisseEntry]
+) -> list[list[Sale]] | None:
+    """Same groups, shuffled until the cash rule is respected (natural look)."""
+    if cash_is_covered(days, [_day_total(g) for g in groups], movements):
+        return groups
+    for _ in range(MAX_SHUFFLE_ATTEMPTS):
+        candidate = random.sample(groups, k=len(groups))
+        if cash_is_covered(days, [_day_total(g) for g in candidate], movements):
+            return candidate
+    return None
+
+
+def _warn_not_covered(
+    days: list[date], groups: list[list[Sale]], movements: list[CaisseEntry]
+) -> None:
+    problem = first_cash_problem(days, [_day_total(g) for g in groups], movements)
+    if problem:
+        m, sold, spent = problem
+        logger.warning(
+            f"Cash expenses cannot be covered on {m.date}: the sales until that date "
+            f"({sold:,.2f}) are lower than the expenses until that date ({spent:,.2f}). "
+            "Move that date later or reduce the amount in caisse.csv. Best order used."
+        )
 
 
 def order_days_for_cash(
@@ -192,40 +231,110 @@ def order_days_for_cash(
     daily_sales: list[list[Sale]],
     movements: list[CaisseEntry],
 ) -> list[list[Sale]]:
-    """ESPECE rule: choose which group of sales goes to which date.
+    """ESPECE rule, by re-ordering: choose which group of sales goes to which date.
 
-    The groups are interchangeable (they hold similar quantities), so we try
-    random orders first (natural look). If none respects the cash rule, the
-    biggest groups are put first, which is the best possible order. If even that
-    fails, the expenses are higher than the sales and a warning is logged.
+    Random orders first (natural look), then the biggest groups first, which is
+    the best possible order. A warning is logged if it still fails.
     """
     if not movements:
         return daily_sales
-
     groups = list(daily_sales)
-
-    def totals(order: list[list[Sale]]) -> list[float]:
-        return [_day_total(g) for g in order]
-
-    if cash_is_covered(days, totals(groups), movements):
-        return groups
-
-    for _ in range(MAX_SHUFFLE_ATTEMPTS):
-        candidate = random.sample(groups, k=len(groups))
-        if cash_is_covered(days, totals(candidate), movements):
-            return candidate
-
-        best = sorted(groups, key=_day_total, reverse=True)
-    if not cash_is_covered(days, totals(best), movements):
-        total_sales = sum(totals(best))
-        total_spent = sum(m.amount for m in movements)
-        raise CaisseError(
-            f"Cash expenses ({total_spent:,.2f}) cannot be covered by the sales "
-            f"({total_sales:,.2f}) at the requested dates in caisse.csv. "
-            "Increase the showroom sales, move the expense dates later, "
-            "or reduce the expense amounts."
-        )
+    found = _random_order_that_works(days, groups, movements)
+    if found is not None:
+        return found
+    best = sorted(groups, key=_day_total, reverse=True)
+    _warn_not_covered(days, best, movements)
     return best
+
+
+# Extra safety (in %) added to the needed cash, to absorb the rounding of units
+CASH_MARGINS = (0.02, 0.05, 0.10, 0.20, 0.40)
+
+
+def weighted_quantities(weights: list[float], quantity: int) -> list[int]:
+    """Split `quantity` units over the days proportionally to `weights`."""
+    total_w = sum(weights)
+    if total_w <= 0 or quantity == 0:
+        return [0] * len(weights)
+    raw = [quantity * w / total_w for w in weights]
+    result = [math.floor(x) for x in raw]
+    missing = quantity - sum(result)
+    by_fraction = sorted(
+        range(len(weights)), key=lambda i: (raw[i] - result[i], random.random()), reverse=True
+    )
+    for i in by_fraction[:missing]:
+        result[i] += 1
+    return result
+
+
+def cash_weights(
+    days: list[date],
+    movements: list[CaisseEntry],
+    total_sales: float,
+    margin: float,
+) -> list[float] | None:
+    """How much of the month's sales each day should receive so that, on every
+    expense date, the sales so far cover the expenses so far (plus a margin).
+    Returns None when it is impossible (expense before the first selling day,
+    or more expenses than sales)."""
+    if total_sales <= 0:
+        return None
+    weights = [1.0] * len(days)
+    spent = 0.0
+    for d in sorted({m.date for m in movements}):
+        spent += sum(m.amount for m in movements if m.date == d)
+        k = sum(1 for day in days if day <= d)  # days available up to that date
+        if k == 0 or spent > total_sales + CASH_TOLERANCE:
+            return None
+        target = spent * (1 + margin) / total_sales
+        if target >= 1:
+            for i in range(k, len(weights)):
+                weights[i] = 0.0  # everything must be sold by that date
+            continue
+        before, after = sum(weights[:k]), sum(weights[k:])
+        if after > 0 and before / (before + after) < target:
+            factor = target * after / ((1 - target) * before)
+            for i in range(k):
+                weights[i] *= factor
+    return weights
+
+
+def distribute_for_cash(solver, make_inventory, days: list[date], movements: list[CaisseEntry]):
+    """ESPECE rule. Returns one list of sales per day, in the order of `days`.
+
+    1. Equal split, with the groups re-ordered if that is enough (natural look).
+    2. Otherwise the sales are concentrated in the first days, just enough to pay
+       the expenses on their dates.
+    3. If it is impossible, the best order is used and a warning explains why.
+    """
+    n = len(days)
+    equal = list(solver.distrubute_products_equally(make_inventory(), n))
+    if not movements:
+        return equal
+    found = _random_order_that_works(days, equal, movements)
+    if found is not None:
+        return found
+
+    total_sales = sum(_day_total(g) for g in equal)
+    for margin in CASH_MARGINS:
+        weights = cash_weights(days, movements, total_sales, margin)
+        if weights is None:
+            break
+        groups = list(
+            solver.distrubute_products(
+                make_inventory(),
+                n,
+                quantity_distributor=lambda size, qty, w=weights: weighted_quantities(w, qty),
+            )
+        )
+        if cash_is_covered(days, [_day_total(g) for g in groups], movements):
+            logger.info("\t Sales concentrated in the first days to pay the cash expenses.")
+            return groups
+
+    best = sorted(equal, key=_day_total, reverse=True)
+    _warn_not_covered(days, best, movements)
+    return best
+
 
 def split_daily_sales_by_mode(
     source: Path,
