@@ -22,6 +22,7 @@ class Config:
     IN_ENCODING: str = "cp1252"
     OUT_ENCODING: str = "utf-8"
     YEAR: int = 2026  # Changed with -y via cli arg
+    EXCEL_MAX_ROWS_PER_SHEET: int = 1_000_000  # then a new sheet is started
 
     def create_folders(self):
         for attr in fields(self):

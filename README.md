@@ -70,6 +70,14 @@ mois;showroom;Code-Showroom;mode;date;montant
   If `caisse.csv` is empty, the usual single `daily_sales.csv` is kept.
 
 
+## Big files (more than one Excel sheet)
+Excel shows at most 1,048,576 rows per sheet. If a daily sales file has more than 1,000,000 data rows
+(`EXCEL_MAX_ROWS_PER_SHEET` in `configs.py`), the program writes it as an Excel file
+(`daily_sales_CCP.xlsx`, for example) with several sheets `Feuil1`, `Feuil2`, ... Each sheet is filled,
+then the next one is started, and each sheet keeps the header line. The `.csv` file is then removed.
+Smaller files stay as `.csv`.
+
+
 ## Selling days and holidays
 The daily distribution now covers **every day of the month**, up to the last day (28, 29, 30 or 31).
 Fridays are always skipped. Holidays are skipped too: they are listed in the file `holidays.yml`,

@@ -13,6 +13,7 @@ from find_quantity.models import Inventory, ShowRoom
 from find_quantity.acquire_data.read_merge_configs import parse_merge_configs
 from find_quantity.report import Report
 from find_quantity.utils.workdays import load_holidays, selling_days
+from find_quantity.utils.excel_export import convert_big_csv_files
 from find_quantity.utils.caisse import (
     CCP,
     ESPECE,
@@ -413,6 +414,10 @@ class SplitDailySalesByMode:
             # The separate files hold every row: keep only them, so that CCP and
             # espece are never mixed in one daily sales file.
             (config.STEP_THREE_VALIDATE_PATH / "daily_sales.csv").unlink(missing_ok=True)
+        # Files with more rows than one Excel sheet become an .xlsx with several sheets
+        convert_big_csv_files(
+            config.STEP_THREE_VALIDATE_PATH, config.EXCEL_MAX_ROWS_PER_SHEET
+        )
 
 
 if __name__ == "__main__":

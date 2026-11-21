@@ -71,6 +71,12 @@ class CliArgs:
             url = "git+https://github.com/etdabenzeghiba-lgtm/zin_Find_quantities.git"
 
             try:
+                # 1) always replace the program, even if the version number is the same
+                subprocess.run(
+                    ["pip", "install", "--upgrade", "--force-reinstall", "--no-deps", url],
+                    check=True,
+                )
+                # 2) install the packages it needs, if some are new
                 subprocess.run(["pip", "install", url], check=True)
                 logger.info(
                     "Update finished. run find_quantity --version to confirm the new version"
